@@ -1,0 +1,240 @@
+import { FilterParams } from "@rybbit/shared";
+import { FastifyReply, FastifyRequest } from "fastify";
+import { z } from "zod";
+import { enrichWithTraits } from "../utils/utils.js";
+import { getTimeStatement } from "../utils/timeWindow.js";
+import { GetSessionsResponse } from "../sessions/getSessions.js";
+import { analyticsRoute, runAnalyticsQuery } from "../utils/analyticsQuery.js";
+import { SESSION_CHANNEL_AGG, SESSION_REFERRER_AGG } from "../utils/sessionAttribution.js";
+import { buildFilteredSessionsCTE } from "../utils/sessionFilters.js";
+import { buildFunnelStepCondition, FunnelStep } from "./funnelSteps.js";
+
+type Funnel = {
+  steps: FunnelStep[];
+};
+
+export interface GetFunnelStepSessionsRequest {
+  Body: Funnel;
+  Params: {
+    siteId: string;
+    stepNumber: string;
+  };
+  Querystring: FilterParams<{
+    mode: "reached" | "dropped";
+    limit?: number;
+    page: number;
+    /** "true" lists only the sessions that have a replay. */
+    replays_only?: string;
+  }>;
+}
+
+const replaysOnlySchema = z.enum(["true", "false"]).optional();
+
+export const buildFunnelStepSessionsQuery = (
+  query: GetFunnelStepSessionsRequest["Querystring"],
+  siteId: number,
+  steps: FunnelStep[],
+  stepNumber: number
+) => {
+  const { mode } = query;
+  const replaysOnly = query.replays_only === "true";
+  const timeStatement = getTimeStatement(query);
+  const filteredSessionsCTE = buildFilteredSessionsCTE(query.filters, siteId, timeStatement);
+
+  // Build conditional statements for each step we need
+  const stepsToCheck = mode === "reached" ? stepNumber : stepNumber + 1;
+  const stepConditions = steps.slice(0, stepsToCheck).map(step => buildFunnelStepCondition(step));
+
+  // Build CTEs for each funnel step to identify qualifying sessions. Steps are
+  // ordered by the millisecond timestamp, as in the analyze and summary queries,
+  // so a session counted as continuing is never listed as dropped (a pageview
+  // and the event it fires often share a second).
+  const stepCTEs = [
+    `
+    ${filteredSessionsCTE ? `${filteredSessionsCTE},` : ""}
+    SessionActions AS (
+      SELECT
+        session_id,
+        timestamp_ms,
+        pathname,
+        event_name,
+        type,
+        props,
+        hostname,
+        url_parameters,
+        tag
+      FROM events
+      ${filteredSessionsCTE ? "INNER JOIN FilteredSessions USING (session_id)" : ""}
+      WHERE
+        site_id = {siteId:Int32}
+        ${timeStatement}
+    ),
+    Step1 AS (
+      SELECT DISTINCT
+        session_id,
+        min(timestamp_ms) as step_time
+      FROM SessionActions
+      WHERE ${stepConditions[0]}
+      GROUP BY session_id
+    )`,
+  ];
+
+  // Add CTEs for steps 2 through stepNumber (and +1 for dropped mode)
+  for (let i = 1; i < stepsToCheck; i++) {
+    stepCTEs.push(`
+    Step${i + 1} AS (
+      SELECT DISTINCT
+        s${i}.session_id,
+        min(sa.timestamp_ms) as step_time
+      FROM Step${i} s${i}
+      JOIN SessionActions sa ON s${i}.session_id = sa.session_id
+      WHERE
+        sa.timestamp_ms > s${i}.step_time
+        AND ${stepConditions[i]}
+      GROUP BY s${i}.session_id
+    )`);
+  }
+
+  // Determine which sessions to retrieve
+  const replayCondition = replaysOnly ? "session_id IN (SELECT session_id FROM ReplaySessions)" : "";
+  let targetSessionsCTE = "";
+  if (mode === "reached") {
+    // Sessions that completed step N
+    targetSessionsCTE = `
+    TargetSessions AS (
+      SELECT session_id
+      FROM Step${stepNumber}
+      ${replayCondition ? `WHERE ${replayCondition}` : ""}
+    )`;
+  } else {
+    // Sessions that completed step N but NOT step N+1
+    targetSessionsCTE = `
+    TargetSessions AS (
+      SELECT session_id
+      FROM Step${stepNumber}
+      WHERE session_id NOT IN (
+        SELECT session_id
+        FROM Step${stepNumber + 1}
+      )
+      ${replayCondition ? `AND ${replayCondition}` : ""}
+    )`;
+  }
+
+  // Build main query to aggregate session data
+  return `
+    WITH
+    ${stepCTEs.join(",\n")}
+    ,
+    -- Same rule as the sessions list: a replay with at least two recorded events
+    ReplaySessions AS (
+      SELECT DISTINCT session_id
+      FROM session_replay_metadata_v2
+      FINAL
+      WHERE site_id = {siteId:Int32}
+        AND event_count >= 2
+    )
+    ,
+    ${targetSessionsCTE}
+    ,
+    AggregatedSessions AS (
+      SELECT
+        e.session_id,
+        e.user_id,
+        argMax(e.identified_user_id, e.timestamp) AS identified_user_id,
+        argMax(e.country, e.timestamp) AS country,
+        argMax(e.region, e.timestamp) AS region,
+        argMax(e.city, e.timestamp) AS city,
+        argMax(e.language, e.timestamp) AS language,
+        argMax(e.device_type, e.timestamp) AS device_type,
+        argMax(e.browser, e.timestamp) AS browser,
+        argMax(e.browser_version, e.timestamp) AS browser_version,
+        argMax(e.operating_system, e.timestamp) AS operating_system,
+        argMax(e.operating_system_version, e.timestamp) AS operating_system_version,
+        argMax(e.screen_width, e.timestamp) AS screen_width,
+        argMax(e.screen_height, e.timestamp) AS screen_height,
+        ${SESSION_REFERRER_AGG} AS referrer,
+        ${SESSION_CHANNEL_AGG} AS channel,
+        argMin(e.hostname, e.timestamp) AS hostname,
+        argMin(e.page_title, e.timestamp) AS page_title,
+        argMin(e.querystring, e.timestamp) AS querystring,
+        argMin(e.url_parameters, e.timestamp)['utm_source'] AS utm_source,
+        argMin(e.url_parameters, e.timestamp)['utm_medium'] AS utm_medium,
+        argMin(e.url_parameters, e.timestamp)['utm_campaign'] AS utm_campaign,
+        argMin(e.url_parameters, e.timestamp)['utm_term'] AS utm_term,
+        argMin(e.url_parameters, e.timestamp)['utm_content'] AS utm_content,
+        MAX(e.timestamp) AS session_end,
+        MIN(e.timestamp) AS session_start,
+        dateDiff('second', MIN(e.timestamp), MAX(e.timestamp)) AS session_duration,
+        argMinIf(e.pathname, e.timestamp_ms, e.type = 'pageview') AS entry_page,
+        argMaxIf(e.pathname, e.timestamp_ms, e.type = 'pageview') AS exit_page,
+        countIf(e.type = 'pageview') AS pageviews,
+        countIf(e.type = 'custom_event') AS events,
+        countIf(e.type = 'error') AS errors,
+        countIf(e.type = 'outbound') AS outbound,
+        argMax(e.ip, e.timestamp) AS ip,
+        argMax(e.lat, e.timestamp) AS lat,
+        argMax(e.lon, e.timestamp) AS lon,
+        argMax(e.tag, e.timestamp) AS tag
+      FROM events e
+      INNER JOIN TargetSessions ts ON e.session_id = ts.session_id
+      WHERE
+        e.site_id = {siteId:Int32}
+        ${timeStatement}
+      GROUP BY
+        e.session_id,
+        e.user_id
+    )
+    SELECT
+      a.*,
+      if(r.session_id != '', 1, 0) AS has_replay
+    FROM AggregatedSessions a
+    LEFT JOIN ReplaySessions r ON a.session_id = r.session_id
+    ORDER BY a.session_end DESC
+    LIMIT {limit:Int32} OFFSET {offset:Int32}
+    `;
+};
+
+export const getFunnelStepSessions = analyticsRoute<GetFunnelStepSessionsRequest>(
+  "funnel step sessions",
+  async (req: FastifyRequest<GetFunnelStepSessionsRequest>, res: FastifyReply) => {
+    const { steps } = req.body;
+    const { stepNumber: stepNumberStr, siteId } = req.params;
+    const { mode, page, limit } = req.query;
+
+    const stepNumber = parseInt(stepNumberStr, 10);
+
+    // Validate request
+    if (!steps || steps.length < 2) {
+      return res.status(400).send({ error: "At least 2 steps are required for a funnel" });
+    }
+
+    if (isNaN(stepNumber) || stepNumber < 1 || stepNumber > steps.length) {
+      return res.status(400).send({ error: "Invalid step number" });
+    }
+
+    if (mode !== "reached" && mode !== "dropped") {
+      return res.status(400).send({ error: "Mode must be 'reached' or 'dropped'" });
+    }
+
+    if (!replaysOnlySchema.safeParse(req.query.replays_only).success) {
+      return res.status(400).send({ error: "replays_only must be 'true' or 'false'" });
+    }
+
+    // For final step in "dropped" mode, return empty results (no drop-off possible)
+    if (mode === "dropped" && stepNumber === steps.length) {
+      return res.send({ data: [] });
+    }
+
+    const data = await runAnalyticsQuery<Omit<GetSessionsResponse[number], "traits">>({
+      query: buildFunnelStepSessionsQuery(req.query, Number(siteId), steps, stepNumber),
+      params: {
+        siteId: Number(siteId),
+        limit: limit || 25,
+        offset: ((page || 1) - 1) * (limit || 25),
+      },
+    });
+
+    const dataWithTraits = await enrichWithTraits(data, Number(siteId));
+    return res.send({ data: dataWithTraits });
+  }
+);

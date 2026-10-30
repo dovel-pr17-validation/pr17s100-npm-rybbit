@@ -1,0 +1,46 @@
+import {
+  defineConfig,
+  defineDocs,
+  frontmatterSchema,
+  metaSchema,
+} from 'fumadocs-mdx/config';
+import { z } from 'zod';
+import guideCategories from './src/lib/guide-categories.json';
+
+const guideCategory = z.enum(
+  guideCategories.map(c => c.key) as [string, ...string[]]
+);
+
+export const { docs, meta } = defineDocs({
+  dir: 'content/docs',
+  docs: {
+    // `method` powers the HTTP verb badge shown next to API endpoints in the sidebar
+    schema: frontmatterSchema.extend({
+      method: z.enum(['GET', 'POST', 'PUT', 'DELETE', 'PATCH']).optional(),
+      // `category` groups integration guides on /docs/guides (see src/lib/guide-categories.json)
+      category: guideCategory.optional(),
+    }),
+    postprocess: {
+      includeProcessedMarkdown: true,
+    },
+  },
+});
+
+// Blog collection - separate from docs
+export const blog = defineDocs({
+  dir: 'content/blog',
+  docs: {
+    schema: frontmatterSchema.extend({
+      date: z.string().date().or(z.date()),
+      // Set when a post is substantially revised; drives "Updated", dateModified and the sitemap.
+      updated: z.string().date().or(z.date()).optional(),
+      author: z.string().optional(),
+      image: z.string().optional(),
+      tags: z.array(z.string()).optional(),
+      // Primary search query the post targets; a row in ops/seo/keywords.csv. Checked by `npm run lint:blog`.
+      keyword: z.string().optional(),
+    }),
+  },
+});
+
+export default defineConfig();

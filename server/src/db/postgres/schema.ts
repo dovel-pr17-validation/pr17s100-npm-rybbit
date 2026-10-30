@@ -1,0 +1,930 @@
+import { sql } from "drizzle-orm";
+import type { AnnotationColor, DashboardConfig, Filter, SegmentType } from "@rybbit/shared";
+import {
+  boolean,
+  check,
+  foreignKey,
+  index,
+  integer,
+  jsonb,
+  pgTable,
+  primaryKey,
+  real,
+  serial,
+  text,
+  timestamp,
+  unique,
+  uniqueIndex,
+  pgEnum,
+  uuid,
+} from "drizzle-orm/pg-core";
+
+// User table (BetterAuth)
+export const user = pgTable(
+  "user",
+  {
+    id: text().primaryKey().notNull(),
+    name: text().notNull(),
+    username: text(),
+    email: text().notNull(),
+    emailVerified: boolean().notNull(),
+    image: text(),
+    createdAt: timestamp({ mode: "string" }).notNull(),
+    updatedAt: timestamp({ mode: "string" }).notNull(),
+    role: text().default("user").notNull(),
+    displayUsername: text(),
+    banned: boolean(),
+    banReason: text(),
+    banExpires: timestamp({ mode: "string" }),
+    // deprecated
+    stripeCustomerId: text(),
+    // deprecated
+    overMonthlyLimit: boolean().default(false),
+    // deprecated
+    monthlyEventCount: integer().default(0),
+    sendAutoEmailReports: boolean().default(true),
+    // deprecated - Resend IDs from the retired tip sequence; retained until the
+    // separate contract migration audits and drops the legacy data
+    scheduledTipEmailIds: jsonb("scheduled_tip_email_ids").$type<string[]>().default([]),
+  },
+  table => [unique("user_username_unique").on(table.username), unique("user_email_unique").on(table.email)]
+);
+
+// Verification table (BetterAuth)
+export const verification = pgTable("verification", {
+  id: text().primaryKey().notNull(),
+  identifier: text().notNull(),
+  value: text().notNull(),
+  expiresAt: timestamp({ mode: "string" }).notNull(),
+  createdAt: timestamp({ mode: "string" }),
+  updatedAt: timestamp({ mode: "string" }),
+});
+
+// Sites table
+export const sites = pgTable(
+  "sites",
+  {
+    id: text("id").$defaultFn(() => sql`encode(gen_random_bytes(6), 'hex')`),
+    // deprecated - keeping as primary key for backwards compatibility
+    siteId: serial("site_id").primaryKey().notNull(),
+    name: text("name").notNull(),
+    type: text("type").$type<"web" | "mobile" | null>(),
+    domain: text("domain").notNull(),
+    createdAt: timestamp("created_at", { mode: "string" }).defaultNow(),
+    updatedAt: timestamp("updated_at", { mode: "string" }).defaultNow(),
+    createdBy: text("created_by").references(() => user.id, { onDelete: "set null" }),
+    organizationId: text("organization_id").references(() => organization.id),
+    public: boolean().default(false),
+    embedEnabled: boolean("embed_enabled").default(false),
+    saltUserIds: boolean().default(false),
+    blockBots: boolean().default(true).notNull(),
+    // Site owner declares a first-party proxy (Cloudflare Worker, CloudFront,
+    // nginx, ...) fronts their tracking traffic, so forwarded headers carry the
+    // real visitor IP and must win over the connecting edge IP.
+    firstPartyProxy: boolean("first_party_proxy").default(false),
+    excludedIPs: jsonb("excluded_ips").default([]), // Array of IP addresses/ranges to exclude
+    excludedCountries: jsonb("excluded_countries").default([]), // Array of ISO country codes to exclude (e.g., ["US", "GB"])
+    excludedPaths: jsonb("excluded_paths").default([]).$type<string[]>(), // Array of pathname glob patterns to exclude (e.g., ["/admin/*", "/preview"])
+    excludedHostnames: jsonb("excluded_hostnames").default([]).$type<string[]>(), // Array of hostname glob patterns to exclude (e.g., ["localhost", "*.vercel.app"])
+    excludedUserAgents: jsonb("excluded_user_agents").default([]).$type<string[]>(), // Array of case-insensitive user-agent substrings to exclude (e.g., ["HeadlessChrome"])
+    excludedASNs: jsonb("excluded_asns").default([]).$type<string[]>(), // Array of autonomous system numbers to exclude, with or without "AS" prefix (e.g., ["AS13335", "16509"])
+    excludedQueryParams: jsonb("excluded_query_params").default([]).$type<string[]>(), // Array of query param exclusions: "name" (param present) or "name=value" (value supports * glob), e.g. ["preview", "utm_source=internal-*"]
+    sessionReplay: boolean().default(false),
+    webVitals: boolean().default(false),
+    trackErrors: boolean().default(false),
+    trackOutbound: boolean().default(true),
+    trackUrlParams: boolean().default(true),
+    trackUrlFragments: boolean().default(false),
+    trackInitialPageView: boolean().default(true),
+    trackSpaNavigation: boolean().default(true),
+    trackIp: boolean().default(false),
+    trackButtonClicks: boolean().default(false),
+    trackCopy: boolean().default(false),
+    trackFormInteractions: boolean().default(false),
+    apiKey: text("api_key"), // Format: rb_{64_hex_chars} = 67 chars total
+    privateLinkKey: text("private_link_key"),
+    tags: jsonb("tags").default([]).$type<string[]>(),
+    // Platform fingerprinted from the site's homepage at creation time (e.g. "wordpress",
+    // "next-js"); used to link the right install guide in lifecycle emails
+    detectedPlatform: text("detected_platform"),
+    // Set on sites created from the landing-page domain input before the visitor
+    // has an account (organizationId is null). The site is reachable only via its
+    // privateLinkKey until it is claimed; the cleanup cron deletes it after this.
+    claimExpiresAt: timestamp("claim_expires_at", { mode: "string" }),
+  },
+  table => [
+    check("sites_type_check", sql`${table.type} IS NULL OR ${table.type} IN ('web', 'mobile')`),
+    // Tracking and the route guards resolve a Site by its text id on every
+    // cache miss.
+    index("sites_id_idx").on(table.id),
+  ]
+);
+
+// Active sessions table.
+// DEPRECATED: session tracking moved to Redis (see services/sessions/sessionsService.ts).
+// No longer read or written by the app; kept so existing deployments stay drift-free.
+// Drop it once Redis-backed sessions are verified in production:
+//   DROP TABLE IF EXISTS active_sessions;
+export const activeSessions = pgTable("active_sessions", {
+  sessionId: text("session_id").primaryKey().notNull(),
+  siteId: integer("site_id"),
+  userId: text("user_id"),
+  startTime: timestamp("start_time").defaultNow(),
+  lastActivity: timestamp("last_activity").defaultNow(),
+});
+
+export const funnels = pgTable("funnels", {
+  reportId: serial("report_id").primaryKey().notNull(),
+  siteId: integer("site_id").references(() => sites.siteId, { onDelete: "cascade" }),
+  userId: text("user_id").references(() => user.id, { onDelete: "set null" }),
+  data: jsonb(),
+  createdAt: timestamp("created_at", { mode: "string" }).defaultNow(),
+  updatedAt: timestamp("updated_at", { mode: "string" }).defaultNow(),
+});
+
+export const dashboards = pgTable("dashboards", {
+  dashboardId: serial("dashboard_id").primaryKey().notNull(),
+  siteId: integer("site_id").references(() => sites.siteId, { onDelete: "cascade" }),
+  userId: text("user_id").references(() => user.id, { onDelete: "set null" }),
+  name: text("name").notNull(),
+  config: jsonb("config").notNull().$type<DashboardConfig>().default({ cards: [] }),
+  createdAt: timestamp("created_at", { mode: "string" }).defaultNow(),
+  updatedAt: timestamp("updated_at", { mode: "string" }).defaultNow(),
+});
+
+// Timeline annotations: a note pinned to a date (or range) on the traffic chart.
+// site_id is null for organization-wide annotations, which show on every site
+// in organization_id.
+export const annotations = pgTable(
+  "annotations",
+  {
+    annotationId: serial("annotation_id").primaryKey().notNull(),
+    siteId: integer("site_id").references(() => sites.siteId, { onDelete: "cascade" }),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => organization.id, { onDelete: "cascade" }),
+    userId: text("user_id").references(() => user.id, { onDelete: "set null" }),
+    title: text("title").notNull(),
+    description: text("description"),
+    date: timestamp("date", { mode: "string", withTimezone: true }).notNull(),
+    endDate: timestamp("end_date", { mode: "string", withTimezone: true }),
+    color: text("color").$type<AnnotationColor>(),
+    icon: text("icon"),
+    isPublic: boolean("is_public").notNull().default(false),
+    createdAt: timestamp("created_at", { mode: "string" }).defaultNow(),
+    updatedAt: timestamp("updated_at", { mode: "string" }).defaultNow(),
+  },
+  table => [
+    index("annotations_site_date_idx").on(table.siteId, table.date),
+    index("annotations_org_date_idx").on(table.organizationId, table.date),
+  ]
+);
+
+// Saved segments: a named, reusable set of analytics filters. A segment is
+// scoped to one site or, with a null site_id, to every site in its
+// organization. `type` is reserved so cohorts can share the table later.
+export const segments = pgTable(
+  "segments",
+  {
+    segmentId: serial("segment_id").primaryKey().notNull(),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => organization.id, { onDelete: "cascade" }),
+    siteId: integer("site_id").references(() => sites.siteId, { onDelete: "cascade" }),
+    userId: text("user_id").references(() => user.id, { onDelete: "set null" }),
+    name: text("name").notNull(),
+    description: text("description"),
+    filters: jsonb("filters").notNull().$type<Filter[]>().default([]),
+    isPublic: boolean("is_public").default(false).notNull(),
+    type: text("type").notNull().default("segment").$type<SegmentType>(),
+    createdAt: timestamp("created_at", { mode: "string" }).defaultNow(),
+    updatedAt: timestamp("updated_at", { mode: "string" }).defaultNow(),
+  },
+  table => [
+    index("segments_organization_idx").on(table.organizationId),
+    index("segments_site_idx").on(table.siteId),
+  ]
+);
+
+// Account table (BetterAuth)
+export const account = pgTable("account", {
+  id: text().primaryKey().notNull(),
+  accountId: text().notNull(),
+  providerId: text().notNull(),
+  userId: text()
+    .notNull()
+    .references(() => user.id, { onDelete: "cascade" }),
+  accessToken: text(),
+  refreshToken: text(),
+  idToken: text(),
+  accessTokenExpiresAt: timestamp({ mode: "string" }),
+  refreshTokenExpiresAt: timestamp({ mode: "string" }),
+  scope: text(),
+  password: text(),
+  createdAt: timestamp({ mode: "string" }).notNull(),
+  updatedAt: timestamp({ mode: "string" }).notNull(),
+});
+
+// Organization table (BetterAuth)
+export const organization = pgTable(
+  "organization",
+  {
+    id: text().primaryKey().notNull(),
+    name: text().notNull(),
+    slug: text().notNull(),
+    logo: text(),
+    createdAt: timestamp({ mode: "string" }).notNull(),
+    metadata: text(),
+    stripeCustomerId: text(),
+    monthlyEventCount: integer().default(0),
+    overMonthlyLimit: boolean().default(false),
+    approachingLimitNotifiedPeriodStart: text(),
+    planOverride: text(), // Plan name override (e.g., "pro1m", "standard500k")
+    customPlan: jsonb("custom_plan").$type<{
+      events: number;
+      members: number | null; // null = unlimited
+      websites: number | null; // null = unlimited
+    }>(),
+  },
+  table => [unique("organization_slug_unique").on(table.slug)]
+);
+
+// Member table (BetterAuth)
+export const member = pgTable("member", {
+  id: text().primaryKey().notNull(),
+  organizationId: text()
+    .notNull()
+    .references(() => organization.id),
+  userId: text()
+    .notNull()
+    .references(() => user.id, { onDelete: "cascade" }),
+  role: text().notNull(),
+  createdAt: timestamp({ mode: "string" }).notNull(),
+  // Site access restriction: false = all sites (default), true = only sites in member_site_access
+  hasRestrictedSiteAccess: boolean("has_restricted_site_access").default(false).notNull(),
+});
+
+// Invitation table (BetterAuth)
+export const invitation = pgTable("invitation", {
+  id: text().primaryKey().notNull(),
+  email: text().notNull(),
+  inviterId: text().references(() => user.id, { onDelete: "set null" }),
+  organizationId: text()
+    .notNull()
+    .references(() => organization.id),
+  role: text().notNull(),
+  status: text().notNull(),
+  createdAt: timestamp({ mode: "string" }),
+  expiresAt: timestamp({ mode: "string" }).notNull(),
+  // Site access restriction for the invited member
+  hasRestrictedSiteAccess: boolean("has_restricted_site_access").default(false).notNull(),
+  siteIds: jsonb("site_ids").default([]).$type<number[]>(), // Array of site IDs to grant access to
+  // Raises the invited role on those sites (editor, member or viewer); null = no raise
+  siteRole: text("site_role"),
+  teamId: text().references(() => team.id, { onDelete: "set null" }),
+});
+
+// Member site access junction table - stores which sites a member has access to
+// Only used when member.hasRestrictedSiteAccess = true
+export const memberSiteAccess = pgTable(
+  "member_site_access",
+  {
+    id: serial("id").primaryKey().notNull(),
+    memberId: text("member_id")
+      .notNull()
+      .references(() => member.id, { onDelete: "cascade" }),
+    siteId: integer("site_id")
+      .notNull()
+      .references(() => sites.siteId, { onDelete: "cascade" }),
+    // Raises the member's role on this site (editor, member or viewer); null or lower = their organization role
+    role: text("role"),
+    createdAt: timestamp("created_at", { mode: "string" }).defaultNow().notNull(),
+    createdBy: text("created_by").references(() => user.id, { onDelete: "set null" }),
+  },
+  (table) => [
+    unique("member_site_access_unique").on(table.memberId, table.siteId),
+    index("member_site_access_member_idx").on(table.memberId),
+    index("member_site_access_site_idx").on(table.siteId),
+  ]
+);
+
+// Team table (BetterAuth)
+export const team = pgTable("team", {
+  memberCount: integer().notNull().default(0),
+  id: text().primaryKey(),
+  name: text().notNull(),
+  organizationId: text().notNull().references(() => organization.id, { onDelete: "cascade" }),
+  createdAt: timestamp({ mode: "string" }).notNull(),
+  updatedAt: timestamp({ mode: "string" }),
+});
+
+// Team member table (BetterAuth)
+export const teamMember = pgTable("teamMember", {
+  membershipKey: text().unique(),
+  id: text().primaryKey(),
+  teamId: text().notNull().references(() => team.id, { onDelete: "cascade" }),
+  userId: text().notNull().references(() => user.id, { onDelete: "cascade" }),
+  createdAt: timestamp({ mode: "string" }),
+});
+
+// Team site access junction table - stores which sites belong to a team
+export const teamSiteAccess = pgTable(
+  "team_site_access",
+  {
+    id: serial("id").primaryKey().notNull(),
+    teamId: text("team_id")
+      .notNull()
+      .references(() => team.id, { onDelete: "cascade" }),
+    siteId: integer("site_id")
+      .notNull()
+      .references(() => sites.siteId, { onDelete: "cascade" }),
+    // Raises the team members' role on this site (editor, member or viewer); null or lower = each one's organization role
+    role: text("role"),
+    createdAt: timestamp("created_at", { mode: "string" }).defaultNow().notNull(),
+  },
+  (table) => [
+    unique("team_site_access_unique").on(table.teamId, table.siteId),
+    index("team_site_access_team_idx").on(table.teamId),
+    index("team_site_access_site_idx").on(table.siteId),
+  ]
+);
+
+// Session table (BetterAuth)
+export const session = pgTable(
+  "session",
+  {
+    id: text().primaryKey().notNull(),
+    expiresAt: timestamp({ mode: "string" }).notNull(),
+    token: text().notNull(),
+    createdAt: timestamp({ mode: "string" }).notNull(),
+    updatedAt: timestamp({ mode: "string" }).notNull(),
+    ipAddress: text(),
+    userAgent: text(),
+    userId: text()
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    impersonatedBy: text(),
+    activeOrganizationId: text(),
+    activeTeamId: text(),
+  },
+  table => [unique("session_token_unique").on(table.token)]
+);
+
+// API Key table (BetterAuth)
+export const apiKey = pgTable("apikey", {
+  id: text().primaryKey().notNull(),
+  name: text(),
+  start: text(),
+  prefix: text(),
+  key: text().notNull(),
+  // A user id (configId NULL/"default") or an organization id (configId
+  // "org") — polymorphic, so no FK. Cleanup happens in auth.ts's
+  // deleteUser.afterDelete and afterDeleteOrganization hooks.
+  referenceId: text().notNull(),
+  refillInterval: integer(),
+  refillAmount: integer(),
+  lastRefillAt: timestamp({ mode: "string" }),
+  enabled: boolean().notNull().default(true),
+  rateLimitEnabled: boolean().notNull().default(false),
+  rateLimitTimeWindow: integer(),
+  rateLimitMax: integer(),
+  requestCount: integer().notNull().default(0),
+  remaining: integer(),
+  lastRequest: timestamp({ mode: "string" }),
+  expiresAt: timestamp({ mode: "string" }),
+  createdAt: timestamp({ mode: "string" }).notNull(),
+  updatedAt: timestamp({ mode: "string" }).notNull(),
+  configId: text(),
+  permissions: text(),
+  metadata: jsonb(),
+});
+
+// Legacy Better Auth 1.6 OAuth records, retained for rollback.
+// Better Auth 1.7 uses the separate tables below; legacy tokens are not accepted.
+export const oauthApplication = pgTable("oauthApplication", {
+  id: text().primaryKey().notNull(),
+  name: text().notNull(),
+  icon: text(),
+  metadata: text(),
+  clientId: text().notNull().unique(),
+  clientSecret: text(),
+  redirectUrls: text().notNull(),
+  type: text().notNull(),
+  disabled: boolean().default(false),
+  userId: text().references(() => user.id, { onDelete: "cascade" }),
+  createdAt: timestamp({ mode: "string" }).notNull(),
+  updatedAt: timestamp({ mode: "string" }).notNull(),
+});
+
+export const oauthAccessToken = pgTable("oauthAccessToken", {
+  id: text().primaryKey().notNull(),
+  accessToken: text().notNull().unique(),
+  refreshToken: text().unique(),
+  accessTokenExpiresAt: timestamp({ mode: "string" }).notNull(),
+  refreshTokenExpiresAt: timestamp({ mode: "string" }),
+  clientId: text()
+    .notNull()
+    .references(() => oauthApplication.clientId, { onDelete: "cascade" }),
+  userId: text().references(() => user.id, { onDelete: "cascade" }),
+  scopes: text().notNull(),
+  createdAt: timestamp({ mode: "string" }).notNull(),
+  updatedAt: timestamp({ mode: "string" }).notNull(),
+});
+
+export const oauthConsent = pgTable("oauthConsent", {
+  id: text().primaryKey().notNull(),
+  clientId: text()
+    .notNull()
+    .references(() => oauthApplication.clientId, { onDelete: "cascade" }),
+  userId: text()
+    .notNull()
+    .references(() => user.id, { onDelete: "cascade" }),
+  scopes: text().notNull(),
+  consentGiven: boolean().notNull(),
+  createdAt: timestamp({ mode: "string" }).notNull(),
+  updatedAt: timestamp({ mode: "string" }).notNull(),
+});
+
+// Better Auth 1.7 OAuth/JWT schema. Kysely stores array fields as JSON,
+// even on PostgreSQL; names retain the existing camelCase convention.
+export const jwks = pgTable("jwks", {
+  id: text("id").primaryKey(),
+  publicKey: text("publicKey").notNull(),
+  privateKey: text("privateKey").notNull(),
+  createdAt: timestamp("createdAt", { mode: "string" }).notNull(),
+  expiresAt: timestamp("expiresAt", { mode: "string" }),
+  alg: text("alg"),
+  crv: text("crv"),
+});
+
+export const oauthClient = pgTable(
+  "oauthClient",
+  {
+    id: text("id").primaryKey(),
+    clientId: text("clientId").notNull().unique(),
+    clientSecret: text("clientSecret"),
+    clientDiscoveryId: text("clientDiscoveryId"),
+    disabled: boolean("disabled").default(false),
+    skipConsent: boolean("skipConsent"),
+    enableEndSession: boolean("enableEndSession"),
+    subjectType: text("subjectType"),
+    scopes: jsonb("scopes").$type<string[]>(),
+    clientCredentialsScopes: jsonb("clientCredentialsScopes").$type<string[]>().default([]),
+    userId: text("userId").references(() => user.id, { onDelete: "cascade" }),
+    createdAt: timestamp("createdAt", { mode: "string" }),
+    updatedAt: timestamp("updatedAt", { mode: "string" }),
+    name: text("name"),
+    uri: text("uri"),
+    icon: text("icon"),
+    contacts: jsonb("contacts").$type<string[]>(),
+    tos: text("tos"),
+    policy: text("policy"),
+    softwareId: text("softwareId"),
+    softwareVersion: text("softwareVersion"),
+    softwareStatement: text("softwareStatement"),
+    redirectUris: jsonb("redirectUris").$type<string[]>().notNull(),
+    postLogoutRedirectUris: jsonb("postLogoutRedirectUris").$type<string[]>(),
+    backchannelLogoutUri: text("backchannelLogoutUri"),
+    backchannelLogoutSessionRequired: boolean("backchannelLogoutSessionRequired"),
+    tokenEndpointAuthMethod: text("tokenEndpointAuthMethod"),
+    applicationType: text("applicationType"),
+    jwks: text("jwks"),
+    jwksUri: text("jwksUri"),
+    grantTypes: jsonb("grantTypes").$type<string[]>(),
+    responseTypes: jsonb("responseTypes").$type<string[]>(),
+    requirePKCE: boolean("requirePKCE"),
+    dpopBoundAccessTokens: boolean("dpopBoundAccessTokens").default(false),
+    referenceId: text("referenceId"),
+    metadata: jsonb("metadata"),
+  },
+  table => [index("oauthClient_userId_idx").on(table.userId)]
+);
+
+export const oauthResource = pgTable("oauthResource", {
+  id: text("id").primaryKey(),
+  identifier: text("identifier").notNull().unique(),
+  name: text("name").notNull(),
+  accessTokenTtl: integer("accessTokenTtl"),
+  refreshTokenTtl: integer("refreshTokenTtl"),
+  signingAlgorithm: text("signingAlgorithm"),
+  signingKeyId: text("signingKeyId"),
+  allowedScopes: jsonb("allowedScopes").$type<string[]>(),
+  customClaims: jsonb("customClaims"),
+  dpopBoundAccessTokensRequired: boolean("dpopBoundAccessTokensRequired").default(false),
+  disabled: boolean("disabled").default(false),
+  createdAt: timestamp("createdAt", { mode: "string" }),
+  updatedAt: timestamp("updatedAt", { mode: "string" }),
+  policyVersion: integer("policyVersion").default(1),
+  metadata: jsonb("metadata"),
+});
+
+export const oauthClientResource = pgTable(
+  "oauthClientResource",
+  {
+    id: text("id").primaryKey(),
+    clientId: text("clientId")
+      .notNull()
+      .references(() => oauthClient.clientId, { onDelete: "cascade" }),
+    resourceId: text("resourceId")
+      .notNull()
+      .references(() => oauthResource.identifier, { onDelete: "cascade" }),
+    metadata: jsonb("metadata"),
+    createdAt: timestamp("createdAt", { mode: "string" }),
+  },
+  table => [
+    uniqueIndex("oauthClientResource_clientId_resourceId_uidx").on(table.clientId, table.resourceId),
+    index("oauthClientResource_clientId_idx").on(table.clientId),
+    index("oauthClientResource_resourceId_idx").on(table.resourceId),
+  ]
+);
+
+export const oauthRefreshToken = pgTable(
+  "oauthRefreshToken",
+  {
+    id: text("id").primaryKey(),
+    token: text("token").notNull().unique(),
+    clientId: text("clientId")
+      .notNull()
+      .references(() => oauthClient.clientId, { onDelete: "cascade" }),
+    sessionId: text("sessionId").references(() => session.id, {
+      onDelete: "set null",
+    }),
+    userId: text("userId")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    referenceId: text("referenceId"),
+    authorizationCodeId: text("authorizationCodeId"),
+    resources: jsonb("resources").$type<string[]>(),
+    requestedUserInfoClaims: jsonb("requestedUserInfoClaims").$type<string[]>(),
+    expiresAt: timestamp("expiresAt", { mode: "string" }).notNull(),
+    createdAt: timestamp("createdAt", { mode: "string" }).notNull(),
+    revoked: timestamp("revoked", { mode: "string" }),
+    rotatedAt: timestamp("rotatedAt", { mode: "string" }),
+    rotationReplayResponse: text("rotationReplayResponse"),
+    rotationReplayExpiresAt: timestamp("rotationReplayExpiresAt", { mode: "string" }),
+    authTime: timestamp("authTime", { mode: "string" }),
+    confirmation: jsonb("confirmation"),
+    scopes: jsonb("scopes").$type<string[]>().notNull(),
+  },
+  table => [
+    index("oauthRefreshToken_clientId_idx").on(table.clientId),
+    index("oauthRefreshToken_sessionId_idx").on(table.sessionId),
+    index("oauthRefreshToken_userId_idx").on(table.userId),
+    index("oauthRefreshToken_authorizationCodeId_idx").on(table.authorizationCodeId),
+  ]
+);
+
+export const oauthAccessTokenV2 = pgTable(
+  "oauthAccessTokenV2",
+  {
+    id: text("id").primaryKey(),
+    token: text("token").notNull().unique(),
+    clientId: text("clientId")
+      .notNull()
+      .references(() => oauthClient.clientId, { onDelete: "cascade" }),
+    sessionId: text("sessionId").references(() => session.id, {
+      onDelete: "set null",
+    }),
+    userId: text("userId").references(() => user.id, { onDelete: "cascade" }),
+    referenceId: text("referenceId"),
+    authorizationCodeId: text("authorizationCodeId"),
+    resources: jsonb("resources").$type<string[]>(),
+    requestedUserInfoClaims: jsonb("requestedUserInfoClaims").$type<string[]>(),
+    refreshId: text("refreshId").references(() => oauthRefreshToken.id, {
+      onDelete: "cascade",
+    }),
+    expiresAt: timestamp("expiresAt", { mode: "string" }).notNull(),
+    createdAt: timestamp("createdAt", { mode: "string" }).notNull(),
+    revoked: timestamp("revoked", { mode: "string" }),
+    confirmation: jsonb("confirmation"),
+    scopes: jsonb("scopes").$type<string[]>().notNull(),
+  },
+  table => [
+    index("oauthAccessTokenV2_clientId_idx").on(table.clientId),
+    index("oauthAccessTokenV2_sessionId_idx").on(table.sessionId),
+    index("oauthAccessTokenV2_userId_idx").on(table.userId),
+    index("oauthAccessTokenV2_authorizationCodeId_idx").on(table.authorizationCodeId),
+    index("oauthAccessTokenV2_refreshId_idx").on(table.refreshId),
+  ]
+);
+
+export const oauthConsentV2 = pgTable(
+  "oauthConsentV2",
+  {
+    id: text("id").primaryKey(),
+    clientId: text("clientId")
+      .notNull()
+      .references(() => oauthClient.clientId, { onDelete: "cascade" }),
+    userId: text("userId").references(() => user.id, { onDelete: "cascade" }),
+    referenceId: text("referenceId"),
+    resources: jsonb("resources").$type<string[]>(),
+    requestedUserInfoClaims: jsonb("requestedUserInfoClaims").$type<string[]>(),
+    scopes: jsonb("scopes").$type<string[]>().notNull(),
+    createdAt: timestamp("createdAt", { mode: "string" }).notNull(),
+    updatedAt: timestamp("updatedAt", { mode: "string" }).notNull(),
+  },
+  table => [
+    index("oauthConsentV2_clientId_idx").on(table.clientId),
+    index("oauthConsentV2_userId_idx").on(table.userId),
+  ]
+);
+
+export const oauthClientAssertion = pgTable("oauthClientAssertion", {
+  id: text("id").primaryKey(),
+  expiresAt: timestamp("expiresAt", { mode: "string" }).notNull(),
+});
+
+// Goals table for tracking conversion goals
+export const goals = pgTable(
+  "goals",
+  {
+    goalId: serial("goal_id").primaryKey().notNull(),
+    siteId: integer("site_id").notNull(),
+    name: text("name"), // Optional, user-defined name for the goal
+    goalType: text("goal_type").notNull(), // 'path', 'event', 'outbound', 'button_click', 'form_submit', or 'copy'
+    // Configuration specific to the goal type
+    config: jsonb("config").notNull().$type<{
+      // For 'path' type
+      pathPattern?: string; // e.g., "/pricing", "/product/*/view", "/docs/**"
+      // For 'event' type
+      eventName?: string; // e.g., "signup_completed", "file_downloaded"
+      // For autocapture types ('outbound', 'button_click', 'form_submit', 'copy')
+      valuePattern?: string; // e.g., "https://example.com/**", "Sign Up*"
+      // Property filters (for all goal types)
+      eventPropertyKey?: string; // Deprecated - use propertyFilters instead
+      eventPropertyValue?: string | number | boolean; // Deprecated - use propertyFilters instead
+      propertyFilters?: Array<{
+        key: string;
+        value: string | number | boolean;
+      }>; // Array of property filters to match (all must match)
+    }>(),
+    createdAt: timestamp("created_at", { mode: "string" }).defaultNow(),
+  },
+  table => [
+    foreignKey({
+      columns: [table.siteId],
+      foreignColumns: [sites.siteId],
+      name: "goals_site_id_sites_site_id_fk",
+    }).onDelete("cascade"),
+  ]
+);
+
+export type FeatureFlagType = "boolean" | "multivariate" | "remote_config";
+export type FeatureFlagRuntime = "client" | "server" | "both";
+export type ExperimentStatus = "draft" | "running" | "paused" | "completed";
+
+export type FeatureFlagPayloadValue =
+  | string
+  | number
+  | boolean
+  | null
+  | FeatureFlagPayloadValue[]
+  | { [key: string]: FeatureFlagPayloadValue };
+
+export type FeatureFlagRule = {
+  field:
+    | "hostname"
+    | "pathname"
+    | "query"
+    | "referrer"
+    | "language"
+    | "country"
+    | "region"
+    | "city"
+    | "device_type"
+    | "user_id"
+    | "trait";
+  key?: string;
+  operator: "equals" | "not_equals" | "contains" | "starts_with" | "ends_with" | "regex";
+  value: string | number | boolean | Array<string | number | boolean>;
+};
+
+export type FeatureFlagVariant = {
+  key: string;
+  name?: string;
+  rolloutPercentage: number;
+  payload?: FeatureFlagPayloadValue;
+};
+
+export type FeatureFlagConditionSet = {
+  name?: string;
+  rules: FeatureFlagRule[];
+  rolloutPercentage?: number;
+  variants?: FeatureFlagVariant[];
+  payload?: FeatureFlagPayloadValue;
+};
+
+export const featureFlags = pgTable(
+  "feature_flags",
+  {
+    flagId: serial("flag_id").primaryKey().notNull(),
+    siteId: integer("site_id")
+      .notNull()
+      .references(() => sites.siteId, { onDelete: "cascade" }),
+    key: text("key").notNull(),
+    description: text("description"),
+    enabled: boolean("enabled").default(false).notNull(),
+    runtime: text("runtime").default("client").notNull().$type<FeatureFlagRuntime>(),
+    flagType: text("flag_type").default("boolean").notNull().$type<FeatureFlagType>(),
+    payload: jsonb("payload").$type<FeatureFlagPayloadValue>(),
+    variants: jsonb("variants").default([]).notNull().$type<FeatureFlagVariant[]>(),
+    rolloutPercentage: integer("rollout_percentage").default(100).notNull(),
+    rules: jsonb("rules").default([]).notNull().$type<FeatureFlagRule[]>(),
+    conditionSets: jsonb("condition_sets").default([]).notNull().$type<FeatureFlagConditionSet[]>(),
+    salt: text("salt")
+      .default(sql`md5(random()::text || clock_timestamp()::text)`)
+      .notNull(),
+    version: integer("version").default(1).notNull(),
+    createdAt: timestamp("created_at", { mode: "string" }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { mode: "string" }).defaultNow().notNull(),
+  },
+  table => [
+    unique("feature_flags_site_key_unique").on(table.siteId, table.key),
+    index("feature_flags_site_idx").on(table.siteId),
+    check("feature_flags_rollout_check", sql`rollout_percentage >= 0 AND rollout_percentage <= 100`),
+    check("feature_flags_runtime_check", sql`runtime IN ('client', 'server', 'both')`),
+    check("feature_flags_type_check", sql`flag_type IN ('boolean', 'multivariate', 'remote_config')`),
+  ]
+);
+
+export const experiments = pgTable(
+  "experiments",
+  {
+    experimentId: serial("experiment_id").primaryKey().notNull(),
+    siteId: integer("site_id")
+      .notNull()
+      .references(() => sites.siteId, { onDelete: "cascade" }),
+    featureFlagId: integer("feature_flag_id")
+      .notNull()
+      .references(() => featureFlags.flagId, { onDelete: "cascade" }),
+    primaryGoalId: integer("primary_goal_id").references(() => goals.goalId, { onDelete: "set null" }),
+    name: text("name").notNull(),
+    description: text("description"),
+    hypothesis: text("hypothesis"),
+    status: text("status").default("draft").notNull().$type<ExperimentStatus>(),
+    winningVariant: text("winning_variant"),
+    startedAt: timestamp("started_at", { mode: "string" }),
+    endedAt: timestamp("ended_at", { mode: "string" }),
+    createdAt: timestamp("created_at", { mode: "string" }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { mode: "string" }).defaultNow().notNull(),
+  },
+  table => [
+    unique("experiments_site_flag_unique").on(table.siteId, table.featureFlagId),
+    index("experiments_site_idx").on(table.siteId),
+    index("experiments_feature_flag_idx").on(table.featureFlagId),
+    index("experiments_primary_goal_idx").on(table.primaryGoalId),
+    check("experiments_status_check", sql`status IN ('draft', 'running', 'paused', 'completed')`),
+  ]
+);
+
+// Telemetry table for tracking self-hosted instances
+export const telemetry = pgTable("telemetry", {
+  id: serial("id").primaryKey().notNull(),
+  instanceId: text("instance_id").notNull(),
+  timestamp: timestamp("timestamp", { mode: "string" }).notNull().defaultNow(),
+  version: text("version").notNull(),
+  tableCounts: jsonb("table_counts").notNull().$type<Record<string, number>>(),
+  clickhouseSizeGb: real("clickhouse_size_gb").notNull(),
+});
+
+// Google Search Console connections table
+// A pending hand-over of a site to someone outside its organization. The
+// site's admin names a recipient by email; the recipient accepts into an
+// organization they administer. The id is the secret in the emailed link. At
+// most one per site; the row is deleted when the transfer is accepted,
+// declined, cancelled or superseded, or when the site moves by other means.
+export const siteTransfers = pgTable(
+  "site_transfers",
+  {
+    id: text("id").primaryKey().notNull(),
+    siteId: integer("site_id")
+      .notNull()
+      .references(() => sites.siteId, { onDelete: "cascade" }),
+    sourceOrganizationId: text("source_organization_id")
+      .notNull()
+      .references(() => organization.id, { onDelete: "cascade" }),
+    recipientEmail: text("recipient_email").notNull(),
+    createdBy: text("created_by").references(() => user.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { mode: "string" }).defaultNow().notNull(),
+    expiresAt: timestamp("expires_at", { mode: "string" }).notNull(),
+  },
+  table => [unique("site_transfers_site_unique").on(table.siteId)]
+);
+
+export const gscConnections = pgTable("gsc_connections", {
+  siteId: integer("site_id")
+    .primaryKey()
+    .notNull()
+    .references(() => sites.siteId, { onDelete: "cascade" }),
+
+  // OAuth tokens
+  accessToken: text("access_token").notNull(),
+  refreshToken: text("refresh_token").notNull(),
+  expiresAt: timestamp("expires_at", { mode: "string" }).notNull(),
+
+  // Which GSC property this connection is for
+  gscPropertyUrl: text("gsc_property_url").notNull(),
+
+  createdAt: timestamp("created_at", { mode: "string" }).defaultNow().notNull(),
+  updatedAt: timestamp("updated_at", { mode: "string" }).defaultNow().notNull(),
+});
+
+// User profiles - stores identified user traits (email, name, custom fields)
+export const userProfiles = pgTable(
+  "user_profiles",
+  {
+    siteId: integer("site_id")
+      .notNull()
+      .references(() => sites.siteId, { onDelete: "cascade" }),
+    userId: text("user_id").notNull(), // The identified user ID from identify() call
+    traits: jsonb("traits").$type<Record<string, unknown>>().default({}),
+    createdAt: timestamp("created_at", { mode: "string" }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { mode: "string" }).defaultNow().notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.siteId, table.userId] }),
+    index("user_profiles_site_idx").on(table.siteId),
+  ]
+);
+
+// User aliases - maps anonymous IDs to identified users (multi-device support)
+export const userAliases = pgTable(
+  "user_aliases",
+  {
+    id: serial("id").primaryKey().notNull(),
+    siteId: integer("site_id")
+      .notNull()
+      .references(() => sites.siteId, { onDelete: "cascade" }),
+    anonymousId: text("anonymous_id").notNull(), // Hash of IP+UserAgent (device fingerprint)
+    userId: text("user_id").notNull(), // The identified user ID
+    createdAt: timestamp("created_at", { mode: "string" }).defaultNow().notNull(),
+  },
+  (table) => [
+    unique("user_aliases_site_anon_unique").on(table.siteId, table.anonymousId),
+    index("user_aliases_user_idx").on(table.siteId, table.userId),
+    index("user_aliases_anon_idx").on(table.siteId, table.anonymousId),
+  ]
+);
+
+// Cancellation feedback for churn reduction
+export const cancellationFeedback = pgTable("cancellation_feedback", {
+  id: serial("id").primaryKey().notNull(),
+  organizationId: text("organization_id").notNull(),
+  userId: text("user_id").notNull(),
+  reason: text("reason").notNull(),
+  reasonDetails: text("reason_details"),
+  retentionOfferShown: text("retention_offer_shown"),
+  retentionOfferAccepted: boolean("retention_offer_accepted").default(false),
+  outcome: text("outcome").notNull(),
+  planNameAtCancellation: text("plan_name_at_cancellation"),
+  monthlyEventCountAtCancellation: integer("monthly_event_count_at_cancellation"),
+  createdAt: timestamp("created_at", { mode: "string" }).defaultNow().notNull(),
+});
+
+export const importPlatforms = ["umami", "simple_analytics", "plausible"] as const;
+
+export const importPlatformEnum = pgEnum("import_platform_enum", importPlatforms);
+
+export const importStatus = pgTable(
+  "import_status",
+  {
+    importId: uuid("import_id").primaryKey().notNull().defaultRandom(),
+    siteId: integer("site_id").notNull(),
+    organizationId: text("organization_id").notNull(),
+    platform: importPlatformEnum("platform").notNull(),
+    importedEvents: integer("imported_events").notNull().default(0),
+    skippedEvents: integer("skipped_events").notNull().default(0),
+    invalidEvents: integer("invalid_events").notNull().default(0),
+    startedAt: timestamp("started_at", { mode: "string" }).notNull().defaultNow(),
+    completedAt: timestamp("completed_at", { mode: "string" }),
+  },
+  table => [
+    foreignKey({
+      columns: [table.siteId],
+      foreignColumns: [sites.siteId],
+      name: "import_status_site_id_sites_site_id_fk",
+    }),
+    foreignKey({
+      columns: [table.organizationId],
+      foreignColumns: [organization.id],
+      name: "import_status_organization_id_organization_id_fk",
+    }),
+  ]
+);
+
+// One row per lifecycle email actually sent. The (userId, emailKey) unique index is the
+// idempotency guard for the state-machine cron: per-site emails embed the siteId in the
+// key (e.g. "site_live:42") so each fires at most once.
+export const lifecycleEmailLog = pgTable(
+  "lifecycle_email_log",
+  {
+    id: serial("id").primaryKey().notNull(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    emailKey: text("email_key").notNull(),
+    siteId: integer("site_id"),
+    sentAt: timestamp("sent_at", { mode: "string" }).defaultNow().notNull(),
+  },
+  table => [unique("lifecycle_email_log_user_email_key_unique").on(table.userId, table.emailKey)]
+);
